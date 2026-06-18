@@ -25,6 +25,7 @@
 - 从 `global / cn / top100` 三组关注列表里拿下一层账号
 - `username` 唯一去重
 - 用数据库里的 `crawl_seen` 表维护采集状态
+- `top json` 只做一次性 seed 导入源，导入后统一进入 `crawl_seen`
 - 支持中断后继续，不会从头重复跑
 - 日志直接输出到本地 `logs/*.txt`
 - 遇到 `{"data":null,"err":"rate_limit"}` 会记录：
@@ -47,10 +48,8 @@
 - `avatar_url`
 - `bio`
 - `location`
-- `create_time`
+- `account_created_at`
 - `global_rank`
-- `cn_rank`
-- `en_rank`
 - `classification`
 - `is_cn`
 - `followers_count`
@@ -65,6 +64,8 @@
 - `first_discovered_at`
 - `last_discovered_at`
 - `last_fetched_at`
+- `ctime`
+- `mtime`
 
 ### `crawl_seen`
 
@@ -126,6 +127,13 @@ go run . \
   -import-json './我手动弄来的top数据'
 ```
 
+`-import-json` 的行为是：
+
+- 只抽取其中的 `username`
+- 写入 `crawl_seen`
+- 初始状态统一为 `pending`
+- 不直接给 `kol_rankings` 写业务字段
+
 `-import-json` 支持：
 
 - 单个 json 文件
@@ -141,7 +149,7 @@ go run . \
 - `-rate-limit-sleep`：遇到限流后的休眠时间
 - `-domain`：默认 `web3`
 - `-log-dir`：日志目录，默认 `logs`
-- `-import-json`：导入手工准备的 top100 json 文件或目录
+- `-import-json`：导入手工准备的 top100 json 文件或目录，只把 username 放进 `crawl_seen`
 - `-migrate-only`：只建表，不抓数据
 
 ## 限制说明
@@ -149,8 +157,8 @@ go run . \
 - 当前默认把 `rate_limit` 当成“整体限流”处理
 - 关注列表只有 `username/name/avatar`，没有对方自己的 rank
 - 所以只有当某个账号“轮到它自己被请求”时，主表里的 `global_rank` 才能被可靠补全
-- 手工导入的全球榜单会写 `global_rank`；华语榜单写 `cn_rank`；英文榜单写 `en_rank`
-- 手工导入榜单不会把账号标记成“已抓过详情”，后续 BFS 仍会继续请求它自己的详情页
+- 手工导入的 top JSON 只负责提供起步 `username`
+- 主表里的业务字段全部以真实 `user-info` 请求结果为准
 
 ## 建议跑法
 

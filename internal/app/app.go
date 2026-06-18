@@ -169,14 +169,13 @@ func importJSONIfNeeded(ctx context.Context, st *store.Store, logger *log.Logger
 		if err != nil {
 			return fmt.Errorf("load import file %s: %w", path, err)
 		}
-		rankKind := detectImportedRankKind(path)
 		for _, row := range rows {
-			if err := st.SaveImportedTopRanking(ctx, row, rankKind, time.Now()); err != nil {
+			if err := st.SaveImportedSeed(ctx, row, time.Now()); err != nil {
 				return fmt.Errorf("import row from %s: %w", path, err)
 			}
 			imported++
 		}
-		logger.Printf("imported file path=%s rows=%d rank_kind=%s", path, len(rows), rankKind)
+		logger.Printf("imported file path=%s rows=%d", path, len(rows))
 	}
 	logger.Printf("json import finished total_rows=%d", imported)
 	return nil
@@ -235,20 +234,6 @@ func loadTopRankingRows(path string) ([]model.TopRankingRow, error) {
 		return nil, err
 	}
 	return list.Data, nil
-}
-
-func detectImportedRankKind(path string) model.ImportedRankKind {
-	value := strings.ToLower(path)
-	switch {
-	case strings.Contains(value, "全球") || strings.Contains(value, "global"):
-		return model.ImportedRankKindGlobal
-	case strings.Contains(value, "华语") || strings.Contains(value, "/cn") || strings.Contains(value, " chinese") || strings.Contains(value, "cn_"):
-		return model.ImportedRankKindCN
-	case strings.Contains(value, "英文") || strings.Contains(value, "english") || strings.Contains(value, "/en") || strings.Contains(value, "en_"):
-		return model.ImportedRankKindEN
-	default:
-		return model.ImportedRankKindUnknown
-	}
 }
 
 func parseSeeds(raw string) []string {

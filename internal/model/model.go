@@ -11,8 +11,6 @@ type KOLRanking struct {
 	Location                string
 	CreateTime              *time.Time
 	GlobalRank              *int
-	CNRank                  *int
-	ENRank                  *int
 	Classification          string
 	IsCN                    bool
 	FollowersCount          int64
@@ -135,12 +133,3 @@ type TopRankingRow struct {
 		TweetsCount     int64  `json:"tweets_count"`
 	} `json:"profile"`
 }
-
-type ImportedRankKind string
-
-const (
-	ImportedRankKindUnknown ImportedRankKind = "unknown"
-	ImportedRankKindGlobal  ImportedRankKind = "global"
-	ImportedRankKindCN      ImportedRankKind = "cn"
-	ImportedRankKindEN      ImportedRankKind = "en"
-)
