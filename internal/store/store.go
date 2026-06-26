@@ -3,11 +3,14 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 
 	"xhunt-hunter/internal/model"
 )
@@ -16,7 +19,28 @@ type Store struct {
 	db *sql.DB
 }
 
+const (
+	dbRetryMaxAttempts  = 3
+	dbRetryInitialDelay = 500 * time.Millisecond
+	dbRetryMaxDelay     = 2 * time.Second
+)
+
 func Open(dsn string) (*Store, error) {
+	parsedDSN, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if parsedDSN.Timeout <= 0 {
+		parsedDSN.Timeout = 5 * time.Second
+	}
+	if parsedDSN.ReadTimeout <= 0 {
+		parsedDSN.ReadTimeout = 10 * time.Second
+	}
+	if parsedDSN.WriteTimeout <= 0 {
+		parsedDSN.WriteTimeout = 10 * time.Second
+	}
+
+	dsn = parsedDSN.FormatDSN()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
@@ -35,7 +59,9 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Ping(ctx context.Context) error {
-	return s.db.PingContext(ctx)
+	return withDBRetry(ctx, func() error {
+		return s.db.PingContext(ctx)
+	})
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -46,10 +72,26 @@ func (s *Store) Migrate(ctx context.Context) error {
 			continue
 		}
 		if _, err := s.db.ExecContext(ctx, sqlText); err != nil {
+			if shouldIgnoreMigrationError(sqlText, err) {
+				continue
+			}
 			return fmt.Errorf("migrate failed: %w, sql=%s", err, sqlText)
 		}
 	}
 	return nil
+}
+
+func shouldIgnoreMigrationError(sqlText string, err error) bool {
+	mysqlErr, ok := err.(*mysql.MySQLError)
+	if !ok {
+		return false
+	}
+
+	if mysqlErr.Number == 1060 && strings.Contains(sqlText, "ADD COLUMN user_id") {
+		return true
+	}
+
+	return false
 }
 
 func (s *Store) SeedAccounts(ctx context.Context, seeds []string) error {
@@ -70,7 +112,9 @@ func (s *Store) SeedAccounts(ctx context.Context, seeds []string) error {
 }
 
 func (s *Store) NextPendingAccount(ctx context.Context, maxDepth int, now time.Time) (*model.PendingAccount, error) {
-	row := s.db.QueryRowContext(ctx, `
+	var item model.PendingAccount
+	err := withDBRetry(ctx, func() error {
+		row := s.db.QueryRowContext(ctx, `
 SELECT username, discovery_depth
 FROM crawl_seen
 WHERE is_fetched = 0
@@ -83,9 +127,9 @@ WHERE is_fetched = 0
 ORDER BY discovery_depth ASC, last_enqueued_at ASC, username ASC
 LIMIT 1
 `, maxDepth, now.Unix())
-
-	var item model.PendingAccount
-	if err := row.Scan(&item.Username, &item.DiscoveryDepth); err != nil {
+		return row.Scan(&item.Username, &item.DiscoveryDepth)
+	})
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -125,7 +169,7 @@ ORDER BY discovery_depth ASC, last_success_at ASC, username ASC
 		args = append(args, limit)
 	}
 
-	result, err := s.db.ExecContext(ctx, query, args...)
+	result, err := execContextWithRetry(ctx, s.db, query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -137,7 +181,7 @@ ORDER BY discovery_depth ASC, last_success_at ASC, username ASC
 }
 
 func (s *Store) MarkAttempt(ctx context.Context, username string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 UPDATE crawl_seen
 SET attempt_count = attempt_count + 1,
     last_attempt_at = ?,
@@ -148,7 +192,7 @@ WHERE username = ?
 }
 
 func (s *Store) MarkFetchedSuccess(ctx context.Context, username string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 UPDATE crawl_seen
 SET is_fetched = 1,
     fetch_status = 'success',
@@ -161,7 +205,7 @@ WHERE username = ?
 }
 
 func (s *Store) MarkRateLimited(ctx context.Context, username string, now, nextRetry time.Time, lastError string) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 UPDATE crawl_seen
 SET fetch_status = 'rate_limited',
     rate_limit_count = rate_limit_count + 1,
@@ -173,7 +217,7 @@ WHERE username = ?
 }
 
 func (s *Store) MarkFailed(ctx context.Context, username string, now, nextRetry time.Time, lastError string) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 UPDATE crawl_seen
 SET fetch_status = 'failed',
     next_retry_at = ?,
@@ -184,7 +228,7 @@ WHERE username = ?
 }
 
 func (s *Store) MarkTerminalSkip(ctx context.Context, username, status, lastError string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 UPDATE crawl_seen
 SET is_fetched = 1,
     fetch_status = ?,
@@ -205,14 +249,18 @@ func (s *Store) SaveFetchedAccount(ctx context.Context, username string, depth i
 		globalRank = *info.Feature.Rank.KOLRank
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 INSERT INTO kol_rankings (
-  username, display_name, profile_url, avatar_url, bio, location, account_created_at,
+  username, user_id, display_name, profile_url, avatar_url, bio, location, account_created_at,
   global_rank, classification, is_cn, followers_count, following_count, listed_count, tweets_count,
   global_kol_followers_count, cn_kol_followers_count, top_kol_followers_count,
   discovery_depth, discovered_by_count, first_discovered_at, last_discovered_at, last_fetched_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
+  user_id = CASE
+    WHEN VALUES(user_id) <> '' THEN VALUES(user_id)
+    ELSE user_id
+  END,
   display_name = VALUES(display_name),
   profile_url = VALUES(profile_url),
   avatar_url = VALUES(avatar_url),
@@ -232,7 +280,7 @@ ON DUPLICATE KEY UPDATE
   discovery_depth = LEAST(discovery_depth, VALUES(discovery_depth)),
   last_discovered_at = GREATEST(last_discovered_at, VALUES(last_discovered_at)),
   last_fetched_at = VALUES(last_fetched_at)
-`, username, info.Name, fmt.Sprintf("https://x.com/%s", username), avatar, firstNonEmpty(info.Desc, info.Profile.Description),
+	`, username, strings.TrimSpace(info.ID), info.Name, fmt.Sprintf("https://x.com/%s", username), avatar, firstNonEmpty(info.Desc, info.Profile.Description),
 		info.Profile.Location, accountCreatedAt, globalRank, info.AI.Classification, info.AI.IsCN,
 		info.Profile.FollowersCount, info.Profile.FollowingCount, info.Profile.ListedCount, info.Profile.TweetsCount,
 		info.Feature.KOLFollowers.GlobalKOLFollowersCount, info.Feature.KOLFollowers.CNKOLFollowersCount,
@@ -245,7 +293,7 @@ func (s *Store) SaveImportedSeed(ctx context.Context, row model.TopRankingRow, n
 	if username == "" {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 INSERT INTO crawl_seen (
   username, discovery_depth, is_enqueued, is_fetched, fetch_status,
   attempt_count, rate_limit_count, first_enqueued_at, last_enqueued_at
@@ -413,7 +461,7 @@ ON DUPLICATE KEY UPDATE
   last_discovered_at = GREATEST(last_discovered_at, VALUES(last_discovered_at))
 `, strings.Join(values, ","))
 
-	_, err := tx.ExecContext(ctx, query, args...)
+	_, err := txExecContextWithRetry(ctx, tx, query, args...)
 	return err
 }
 
@@ -431,7 +479,7 @@ INSERT IGNORE INTO crawl_edges (
 ) VALUES %s
 `, strings.Join(values, ","))
 
-	_, err := tx.ExecContext(ctx, query, args...)
+	_, err := txExecContextWithRetry(ctx, tx, query, args...)
 	return err
 }
 
@@ -456,7 +504,7 @@ SET discovered_by_count = discovered_by_count + 1,
 WHERE username IN (%s)
 `, strings.Join(placeholders, ","))
 
-	_, err := tx.ExecContext(ctx, query, args...)
+	_, err := txExecContextWithRetry(ctx, tx, query, args...)
 	return err
 }
 
@@ -479,12 +527,12 @@ ON DUPLICATE KEY UPDATE
   last_enqueued_at = VALUES(last_enqueued_at)
 `, strings.Join(values, ","))
 
-	_, err := tx.ExecContext(ctx, query, args...)
+	_, err := txExecContextWithRetry(ctx, tx, query, args...)
 	return err
 }
 
 func (s *Store) upsertDiscoveredAccount(ctx context.Context, username, displayName, avatarURL string, depth int, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 INSERT INTO kol_rankings (
   username, display_name, profile_url, avatar_url, discovery_depth, discovered_by_count,
   first_discovered_at, last_discovered_at
@@ -509,7 +557,7 @@ ON DUPLICATE KEY UPDATE
 }
 
 func (s *Store) upsertSeen(ctx context.Context, username string, depth int, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 INSERT INTO crawl_seen (
   username, discovery_depth, is_enqueued, is_fetched, fetch_status,
   attempt_count, rate_limit_count, first_enqueued_at, last_enqueued_at
@@ -523,7 +571,7 @@ ON DUPLICATE KEY UPDATE
 }
 
 func (s *Store) insertEdge(ctx context.Context, sourceUsername, targetUsername, bucket string, depth int, now time.Time) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `
+	result, err := execContextWithRetry(ctx, s.db, `
 INSERT IGNORE INTO crawl_edges (
   source_username, target_username, source_bucket, discovery_depth, discovered_at
 ) VALUES (?, ?, ?, ?, ?)
@@ -539,7 +587,7 @@ INSERT IGNORE INTO crawl_edges (
 }
 
 func (s *Store) incrementDiscoveredByCount(ctx context.Context, username string, depth int, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execContextWithRetry(ctx, s.db, `
 UPDATE kol_rankings
 SET discovered_by_count = discovered_by_count + 1,
     discovery_depth = LEAST(discovery_depth, ?),
@@ -553,6 +601,96 @@ func normalizeUsername(v string) string {
 	v = strings.TrimSpace(v)
 	v = strings.TrimPrefix(v, "@")
 	return strings.ToLower(v)
+}
+
+func execContextWithRetry(ctx context.Context, execer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, query string, args ...any) (sql.Result, error) {
+	var result sql.Result
+	err := withDBRetry(ctx, func() error {
+		var err error
+		result, err = execer.ExecContext(ctx, query, args...)
+		return err
+	})
+	return result, err
+}
+
+func txExecContextWithRetry(ctx context.Context, tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	return execContextWithRetry(ctx, tx, query, args...)
+}
+
+func withDBRetry(ctx context.Context, fn func() error) error {
+	delay := dbRetryInitialDelay
+	var lastErr error
+	for attempt := 1; attempt <= dbRetryMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableDBError(err) || attempt == dbRetryMaxAttempts {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+		if delay > dbRetryMaxDelay {
+			delay = dbRetryMaxDelay
+		}
+	}
+	return lastErr
+}
+
+func isRetryableDBError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == driver.ErrBadConn || err == sql.ErrConnDone {
+		return true
+	}
+	var netErr net.Error
+	if ok := errors.As(err, &netErr); ok {
+		return true
+	}
+	var mysqlErr *mysql.MySQLError
+	if ok := errors.As(err, &mysqlErr); ok {
+		switch mysqlErr.Number {
+		case 1040, 1042, 1047, 1158, 1159, 1160, 1161, 1184, 1205, 1213, 1317, 2002, 2003, 2006, 2013:
+			return true
+		}
+	}
+
+	message := strings.ToLower(err.Error())
+	for _, keyword := range []string{
+		"server has gone away",
+		"bad connection",
+		"connection refused",
+		"connection reset by peer",
+		"broken pipe",
+		"invalid connection",
+		"unexpected eof",
+		"i/o timeout",
+		"timeout",
+		"context deadline exceeded",
+	} {
+		if strings.Contains(message, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func IsRetryableDBError(err error) bool {
+	return isRetryableDBError(err)
 }
 
 func normalizeDepths(depths []int) []int {
@@ -595,6 +733,7 @@ const schemaSQL = `
 CREATE TABLE IF NOT EXISTS kol_rankings (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键' PRIMARY KEY,
   username VARCHAR(64) NOT NULL DEFAULT '' COMMENT '账号唯一标识，统一转成小写 username',
+  user_id VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'Twitter用户ID',
   display_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '账号显示名',
   profile_url VARCHAR(1024) NOT NULL DEFAULT '' COMMENT 'X 个人主页 URL',
   avatar_url VARCHAR(1024) NOT NULL DEFAULT '' COMMENT '头像 URL',
@@ -622,7 +761,7 @@ CREATE TABLE IF NOT EXISTS kol_rankings (
   KEY idx_global_rank (global_rank),
   KEY idx_last_fetched_at (last_fetched_at),
   KEY idx_discovery_depth (discovery_depth)
-) COMMENT='给其他项目读取的 KOL 主表，一账号一行';
+) COMMENT='给其他项目读取的 KOL 主表，一账号一行' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS crawl_seen (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键' PRIMARY KEY,
@@ -644,7 +783,7 @@ CREATE TABLE IF NOT EXISTS crawl_seen (
   UNIQUE KEY uniq_username (username),
   KEY idx_pending (is_fetched, discovery_depth, next_retry_at),
   KEY idx_status (fetch_status)
-) COMMENT='采集器内部状态表，用于断点续跑和限流恢复';
+) COMMENT='采集器内部状态表，用于断点续跑和限流恢复' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS crawl_edges (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键' PRIMARY KEY,
@@ -658,6 +797,15 @@ CREATE TABLE IF NOT EXISTS crawl_edges (
   UNIQUE KEY uniq_source_target (source_username, target_username),
   KEY idx_target (target_username),
   KEY idx_source (source_username)
-) COMMENT='账号发现关系表，记录谁把谁带进 BFS';
+) COMMENT='账号发现关系表，记录谁把谁带进 BFS' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE kol_rankings
+  ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'X/Twitter 用户 UID，来自详情接口 data.id' AFTER username;
+
+ALTER TABLE kol_rankings CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+ALTER TABLE crawl_seen CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+ALTER TABLE crawl_edges CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 `

@@ -19,6 +19,8 @@ type Config struct {
 	} `json:"mysql"`
 	XHunt struct {
 		Domain          string `json:"domain"`
+		ProxyPort       int    `json:"proxy_port"`
+		RequestTimeout  string `json:"request_timeout"`
 		Seeds           string `json:"seeds"`
 		ImportJSON      string `json:"import_json"`
 		MaxDepth        int    `json:"max_depth"`
@@ -72,6 +74,7 @@ func defaultConfig() Config {
 	cfg := Config{}
 	cfg.Log.Dir = "logs"
 	cfg.XHunt.Domain = "web3"
+	cfg.XHunt.RequestTimeout = "6s"
 	cfg.XHunt.MaxDepth = 2
 	cfg.XHunt.ExpandRankLimit = 10000
 	cfg.Service.RequestInterval = "15s"
@@ -87,6 +90,10 @@ func defaultConfig() Config {
 
 func (c Config) toAppConfig() (app.Config, error) {
 	requestInterval, err := parseDuration("service.request_interval", c.Service.RequestInterval)
+	if err != nil {
+		return app.Config{}, err
+	}
+	requestTimeout, err := parseDuration("xhunt.request_timeout", c.XHunt.RequestTimeout)
 	if err != nil {
 		return app.Config{}, err
 	}
@@ -120,6 +127,8 @@ func (c Config) toAppConfig() (app.Config, error) {
 	return app.Config{
 		DSN:                      c.Mysql.Addr,
 		Domain:                   c.XHunt.Domain,
+		ProxyPort:                c.XHunt.ProxyPort,
+		RequestTimeout:           requestTimeout,
 		SeedsRaw:                 c.XHunt.Seeds,
 		MaxDepth:                 c.XHunt.MaxDepth,
 		ExpandRankLimit:          c.XHunt.ExpandRankLimit,

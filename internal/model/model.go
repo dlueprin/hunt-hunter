@@ -3,6 +3,7 @@ package model
 import "time"
 
 type KOLRanking struct {
+	UserID                  string
 	Username                string
 	DisplayName             string
 	ProfileURL              string
@@ -54,6 +55,7 @@ type UserInfoResponse struct {
 }
 
 type UserInfo struct {
+	ID         string     `json:"id"`
 	Name       string     `json:"name"`
 	Desc       string     `json:"desc"`
 	CreateTime *time.Time `json:"create_time"`

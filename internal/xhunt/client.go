@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,11 +21,20 @@ type Client struct {
 	domain     string
 }
 
-func NewClient(domain string) *Client {
+func NewClient(domain string, proxyPort int, requestTimeout time.Duration) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if proxyPort > 0 {
+		transport.Proxy = http.ProxyURL(&url.URL{
+			Scheme: "http",
+			Host:   "127.0.0.1:" + strconv.Itoa(proxyPort),
+		})
+	}
+	if requestTimeout <= 0 {
+		requestTimeout = 6 * time.Second
+	}
 	return &Client{
 		httpClient: &http.Client{
-			Timeout:   30 * time.Second,
+			Timeout:   requestTimeout,
 			Transport: transport,
 		},
 		domain: domain,

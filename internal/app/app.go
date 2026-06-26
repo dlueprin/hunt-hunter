@@ -21,6 +21,8 @@ import (
 type Config struct {
 	DSN                      string
 	Domain                   string
+	ProxyPort                int
+	RequestTimeout           time.Duration
 	SeedsRaw                 string
 	MaxDepth                 int
 	ExpandRankLimit          int
@@ -51,6 +53,19 @@ type Config struct {
 	MigrateOnly              bool
 }
 
+const transientDBRetrySleep = 2 * time.Second
+
+func handleTransientDBError(ctx context.Context, logger *log.Logger, stage, username string, depth int, err error) error {
+	if !store.IsRetryableDBError(err) {
+		return err
+	}
+	logger.Printf("transient db error stage=%s username=%s depth=%d err=%v retry_in=%s", stage, username, depth, err, transientDBRetrySleep)
+	if sleepErr := sleepWithContext(ctx, transientDBRetrySleep); sleepErr != nil {
+		return sleepErr
+	}
+	return nil
+}
+
 func Run(ctx context.Context, cfg Config) error {
 	logger, closeLog, err := newLogger(cfg.LogDir)
 	if err != nil {
@@ -59,9 +74,11 @@ func Run(ctx context.Context, cfg Config) error {
 	defer closeLog()
 
 	logger.Printf(
-		"xhunt-hunter starting max_depth=%d expand_rank_limit=%d request_interval=%s rate_limit_sleep=%s failure_backoff_multiplier=%.2f wifi_recover_after_failures=%d wifi_recover_mode=%s wifi_recover_post_wait=%s replay_on_start=%t replay_success_depths=%v replay_success_limit=%d success_cooldown_every=%d success_cooldown_sleep=%s success_count_every=%d success_cooldownall_sleep=%s",
+		"xhunt-hunter starting max_depth=%d expand_rank_limit=%d proxy_port=%d request_timeout=%s request_interval=%s rate_limit_sleep=%s failure_backoff_multiplier=%.2f wifi_recover_after_failures=%d wifi_recover_mode=%s wifi_recover_post_wait=%s replay_on_start=%t replay_success_depths=%v replay_success_limit=%d success_cooldown_every=%d success_cooldown_sleep=%s success_count_every=%d success_cooldownall_sleep=%s",
 		cfg.MaxDepth,
 		cfg.ExpandRankLimit,
+		cfg.ProxyPort,
+		cfg.RequestTimeout,
 		cfg.RequestInterval,
 		cfg.RateLimitSleep,
 		cfg.FailureBackoffMultiplier,
@@ -83,13 +100,19 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer st.Close()
 
-	if err := st.Ping(ctx); err != nil {
-		return err
-	}
-	if err := st.Migrate(ctx); err != nil {
-		return err
+	for {
+		if err := st.Ping(ctx); err != nil {
+			if retryErr := handleTransientDBError(ctx, logger, "ping", "", 0, err); retryErr == nil {
+				continue
+			}
+			return err
+		}
+		break
 	}
 	if cfg.MigrateOnly {
+		if err := st.Migrate(ctx); err != nil {
+			return err
+		}
 		logger.Printf("schema migrated, exiting because migrate-only=true")
 		return nil
 	}
@@ -113,7 +136,7 @@ func Run(ctx context.Context, cfg Config) error {
 		logger.Printf("replay requeued successful accounts count=%d depths=%v limit=%d", requeued, cfg.ReplaySuccessDepths, cfg.ReplaySuccessLimit)
 	}
 
-	client := xhunt.NewClient(cfg.Domain)
+	client := xhunt.NewClient(cfg.Domain, cfg.ProxyPort, cfg.RequestTimeout)
 	requestsSinceLastRateLimit := 0
 	requestCount := 0
 	successCount := 0
@@ -130,6 +153,9 @@ func Run(ctx context.Context, cfg Config) error {
 
 		item, err := st.NextPendingAccount(ctx, cfg.MaxDepth, time.Now())
 		if err != nil {
+			if retryErr := handleTransientDBError(ctx, logger, "next_pending_account", "", 0, err); retryErr == nil {
+				continue
+			}
 			return err
 		}
 		if item == nil {
@@ -148,6 +174,9 @@ func Run(ctx context.Context, cfg Config) error {
 		requestCount++
 		requestsSinceLastRateLimit++
 		if err := st.MarkAttempt(ctx, item.Username, now); err != nil {
+			if retryErr := handleTransientDBError(ctx, logger, "mark_attempt", item.Username, item.DiscoveryDepth, err); retryErr == nil {
+				continue
+			}
 			return err
 		}
 
@@ -167,6 +196,9 @@ func Run(ctx context.Context, cfg Config) error {
 				nextRetry.Format(time.RFC3339),
 			)
 			if markErr := st.MarkFailed(ctx, item.Username, time.Now(), nextRetry, err.Error()); markErr != nil {
+				if retryErr := handleTransientDBError(ctx, logger, "mark_failed_after_fetch_error", item.Username, item.DiscoveryDepth, markErr); retryErr == nil {
+					continue
+				}
 				return markErr
 			}
 			if err := sleepWithContext(ctx, retrySleep); err != nil {
@@ -187,7 +219,7 @@ func Run(ctx context.Context, cfg Config) error {
 				if recovered := tryWiFiRecovery(logger, cfg, consecutiveFailures); recovered {
 					consecutiveFailures = 0
 					loopSleep = cfg.WiFiRecoverPostWait
-					client = xhunt.NewClient(cfg.Domain)
+					client = xhunt.NewClient(cfg.Domain, cfg.ProxyPort, cfg.RequestTimeout)
 					logger.Printf("xhunt http client reset after wifi recovery")
 				}
 			}
@@ -204,6 +236,9 @@ func Run(ctx context.Context, cfg Config) error {
 				nextRetry.Format(time.RFC3339),
 			)
 			if err := st.MarkRateLimited(ctx, item.Username, eventAt, nextRetry, "rate_limit"); err != nil {
+				if retryErr := handleTransientDBError(ctx, logger, "mark_rate_limited", item.Username, item.DiscoveryDepth, err); retryErr == nil {
+					continue
+				}
 				return err
 			}
 			requestsSinceLastRateLimit = 0
@@ -218,6 +253,9 @@ func Run(ctx context.Context, cfg Config) error {
 			if strings.EqualFold(errKind, "not_found") {
 				logger.Printf("skip not_found username=%s depth=%d", item.Username, item.DiscoveryDepth)
 				if err := st.MarkTerminalSkip(ctx, item.Username, "not_found", "empty data err=not_found", time.Now()); err != nil {
+					if retryErr := handleTransientDBError(ctx, logger, "mark_terminal_skip", item.Username, item.DiscoveryDepth, err); retryErr == nil {
+						continue
+					}
 					return err
 				}
 				consecutiveFailures = 0
@@ -237,6 +275,9 @@ func Run(ctx context.Context, cfg Config) error {
 				nextRetry.Format(time.RFC3339),
 			)
 			if err := st.MarkFailed(ctx, item.Username, time.Now(), nextRetry, fmt.Sprintf("empty data err=%s", resp.Err)); err != nil {
+				if retryErr := handleTransientDBError(ctx, logger, "mark_failed_after_empty_data", item.Username, item.DiscoveryDepth, err); retryErr == nil {
+					continue
+				}
 				return err
 			}
 			if err := sleepWithContext(ctx, retrySleep); err != nil {
@@ -247,6 +288,9 @@ func Run(ctx context.Context, cfg Config) error {
 
 		now = time.Now()
 		if err := st.SaveFetchedAccount(ctx, item.Username, item.DiscoveryDepth, resp.Data, now); err != nil {
+			if retryErr := handleTransientDBError(ctx, logger, "save_fetched_account", item.Username, item.DiscoveryDepth, err); retryErr == nil {
+				continue
+			}
 			return err
 		}
 		rank := 0
@@ -259,10 +303,16 @@ func Run(ctx context.Context, cfg Config) error {
 			followersByBucket := resp.Data.FollowersByBucket()
 			followersSaved = countFollowers(followersByBucket)
 			if err := st.SaveFollowers(ctx, item.Username, item.DiscoveryDepth, followersByBucket, now); err != nil {
+				if retryErr := handleTransientDBError(ctx, logger, "save_followers", item.Username, item.DiscoveryDepth, err); retryErr == nil {
+					continue
+				}
 				return err
 			}
 		}
 		if err := st.MarkFetchedSuccess(ctx, item.Username, now); err != nil {
+			if retryErr := handleTransientDBError(ctx, logger, "mark_fetched_success", item.Username, item.DiscoveryDepth, err); retryErr == nil {
+				continue
+			}
 			return err
 		}
 		consecutiveFailures = 0

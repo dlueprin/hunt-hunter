@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS kol_rankings (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键' PRIMARY KEY,
   username VARCHAR(64) NOT NULL DEFAULT '' COMMENT '账号唯一标识，统一转成小写 username',
+  user_id VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'Twitter用户ID',
   display_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '账号显示名',
   profile_url VARCHAR(1024) NOT NULL DEFAULT '' COMMENT 'X 个人主页 URL',
   avatar_url VARCHAR(1024) NOT NULL DEFAULT '' COMMENT '头像 URL',
@@ -28,7 +29,7 @@ CREATE TABLE IF NOT EXISTS kol_rankings (
   KEY idx_global_rank (global_rank),
   KEY idx_last_fetched_at (last_fetched_at),
   KEY idx_discovery_depth (discovery_depth)
-) COMMENT='给其他项目读取的 KOL 主表，一账号一行';
+) COMMENT='给其他项目读取的 KOL 主表，一账号一行' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS crawl_seen (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键' PRIMARY KEY,
@@ -50,7 +51,7 @@ CREATE TABLE IF NOT EXISTS crawl_seen (
   UNIQUE KEY uniq_username (username),
   KEY idx_pending (is_fetched, discovery_depth, next_retry_at),
   KEY idx_status (fetch_status)
-) COMMENT='采集器内部状态表，用于断点续跑和限流恢复';
+) COMMENT='采集器内部状态表，用于断点续跑和限流恢复' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS crawl_edges (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键' PRIMARY KEY,
@@ -64,4 +65,13 @@ CREATE TABLE IF NOT EXISTS crawl_edges (
   UNIQUE KEY uniq_source_target (source_username, target_username),
   KEY idx_target (target_username),
   KEY idx_source (source_username)
-) COMMENT='账号发现关系表，记录谁把谁带进 BFS';
+) COMMENT='账号发现关系表，记录谁把谁带进 BFS' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE kol_rankings
+  ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'Twitter用户ID' AFTER username;
+
+ALTER TABLE kol_rankings CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+ALTER TABLE crawl_seen CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+ALTER TABLE crawl_edges CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
