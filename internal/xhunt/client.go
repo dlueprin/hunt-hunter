@@ -21,9 +21,13 @@ type Client struct {
 }
 
 func NewClient(domain string) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
 	return &Client{
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		domain:     domain,
+		httpClient: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: transport,
+		},
+		domain: domain,
 	}
 }
 

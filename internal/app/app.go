@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,19 +14,41 @@ import (
 
 	"xhunt-hunter/internal/model"
 	"xhunt-hunter/internal/store"
+	"xhunt-hunter/internal/wifi"
 	"xhunt-hunter/internal/xhunt"
 )
 
 type Config struct {
-	DSN             string
-	Domain          string
-	SeedsRaw        string
-	MaxDepth        int
-	RequestInterval time.Duration
-	RateLimitSleep  time.Duration
-	LogDir          string
-	ImportJSON      string
-	MigrateOnly     bool
+	DSN                      string
+	Domain                   string
+	SeedsRaw                 string
+	MaxDepth                 int
+	ExpandRankLimit          int
+	RequestInterval          time.Duration
+	RateLimitSleep           time.Duration
+	FailureBackoffMultiplier float64
+	WiFiRecoverAfterFailures int
+	WiFiRecoverMode          string
+	WiFiRecoverService       string
+	WiFiRecoverDevice        string
+	WiFiRecoverSSID          string
+	WiFiRecoverPassword      string
+	WiFiRecoverFromSSID      string
+	WiFiRecoverFromPassword  string
+	WiFiRecoverToSSID        string
+	WiFiRecoverToPassword    string
+	WiFiRecoverWait          time.Duration
+	WiFiRecoverPostWait      time.Duration
+	ReplayOnStart            bool
+	ReplaySuccessDepths      []int
+	ReplaySuccessLimit       int
+	SuccessCooldownEvery     int
+	SuccessCooldownSleep     time.Duration
+	SuccessCountEvery        int
+	SuccessCooldownAllSleep  time.Duration
+	LogDir                   string
+	ImportJSON               string
+	MigrateOnly              bool
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -35,7 +58,24 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer closeLog()
 
-	logger.Printf("xhunt-hunter starting max_depth=%d request_interval=%s rate_limit_sleep=%s", cfg.MaxDepth, cfg.RequestInterval, cfg.RateLimitSleep)
+	logger.Printf(
+		"xhunt-hunter starting max_depth=%d expand_rank_limit=%d request_interval=%s rate_limit_sleep=%s failure_backoff_multiplier=%.2f wifi_recover_after_failures=%d wifi_recover_mode=%s wifi_recover_post_wait=%s replay_on_start=%t replay_success_depths=%v replay_success_limit=%d success_cooldown_every=%d success_cooldown_sleep=%s success_count_every=%d success_cooldownall_sleep=%s",
+		cfg.MaxDepth,
+		cfg.ExpandRankLimit,
+		cfg.RequestInterval,
+		cfg.RateLimitSleep,
+		cfg.FailureBackoffMultiplier,
+		cfg.WiFiRecoverAfterFailures,
+		cfg.WiFiRecoverMode,
+		cfg.WiFiRecoverPostWait,
+		cfg.ReplayOnStart,
+		cfg.ReplaySuccessDepths,
+		cfg.ReplaySuccessLimit,
+		cfg.SuccessCooldownEvery,
+		cfg.SuccessCooldownSleep,
+		cfg.SuccessCountEvery,
+		cfg.SuccessCooldownAllSleep,
+	)
 
 	st, err := store.Open(cfg.DSN)
 	if err != nil {
@@ -65,10 +105,20 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		logger.Printf("seeded %d accounts: %s", len(seeds), strings.Join(seeds, ","))
 	}
+	if cfg.ReplayOnStart && len(cfg.ReplaySuccessDepths) > 0 {
+		requeued, err := st.RequeueSuccessfulAccountsForReplay(ctx, cfg.ReplaySuccessDepths, cfg.ReplaySuccessLimit, time.Now())
+		if err != nil {
+			return err
+		}
+		logger.Printf("replay requeued successful accounts count=%d depths=%v limit=%d", requeued, cfg.ReplaySuccessDepths, cfg.ReplaySuccessLimit)
+	}
 
 	client := xhunt.NewClient(cfg.Domain)
 	requestsSinceLastRateLimit := 0
 	requestCount := 0
+	successCount := 0
+	successCount1 := 0
+	consecutiveFailures := 0
 
 	for {
 		select {
@@ -104,32 +154,92 @@ func Run(ctx context.Context, cfg Config) error {
 		logger.Printf("fetch start username=%s depth=%d request_no=%d", item.Username, item.DiscoveryDepth, requestCount)
 		resp, err := client.FetchUserInfo(ctx, item.Username)
 		if err != nil {
-			nextRetry := time.Now().Add(cfg.RateLimitSleep)
-			logger.Printf("fetch failed username=%s depth=%d err=%v", item.Username, item.DiscoveryDepth, err)
+			consecutiveFailures++
+			retrySleep := nextFailureSleep(cfg.RateLimitSleep, cfg.FailureBackoffMultiplier, consecutiveFailures)
+			nextRetry := time.Now().Add(retrySleep)
+			logger.Printf(
+				"fetch failed username=%s depth=%d err=%v consecutive_failures=%d retry_sleep=%s next_retry_at=%s",
+				item.Username,
+				item.DiscoveryDepth,
+				err,
+				consecutiveFailures,
+				retrySleep,
+				nextRetry.Format(time.RFC3339),
+			)
 			if markErr := st.MarkFailed(ctx, item.Username, time.Now(), nextRetry, err.Error()); markErr != nil {
 				return markErr
+			}
+			if err := sleepWithContext(ctx, retrySleep); err != nil {
+				return err
 			}
 			continue
 		}
 
 		if strings.EqualFold(strings.TrimSpace(resp.Err), "rate_limit") {
-			now = time.Now()
-			nextRetry := now.Add(cfg.RateLimitSleep)
-			logger.Printf("rate_limit username=%s depth=%d at=%s requests_since_last_rate_limit=%d next_retry_at=%s", item.Username, item.DiscoveryDepth, now.Format(time.RFC3339), requestsSinceLastRateLimit, nextRetry.Format(time.RFC3339))
-			if err := st.MarkRateLimited(ctx, item.Username, now, nextRetry, "rate_limit"); err != nil {
+			consecutiveFailures++
+			eventAt := time.Now()
+			accountRetrySleep := time.Duration(0)
+			loopSleep := cfg.RateLimitSleep
+			if loopSleep < 0 {
+				loopSleep = 0
+			}
+			if shouldTriggerWiFiRecovery(cfg, consecutiveFailures) {
+				if recovered := tryWiFiRecovery(logger, cfg, consecutiveFailures); recovered {
+					consecutiveFailures = 0
+					loopSleep = cfg.WiFiRecoverPostWait
+					client = xhunt.NewClient(cfg.Domain)
+					logger.Printf("xhunt http client reset after wifi recovery")
+				}
+			}
+			nextRetry := eventAt
+			logger.Printf(
+				"rate_limit username=%s depth=%d at=%s requests_since_last_rate_limit=%d consecutive_failures=%d account_retry_sleep=%s loop_sleep=%s next_retry_at=%s",
+				item.Username,
+				item.DiscoveryDepth,
+				eventAt.Format(time.RFC3339),
+				requestsSinceLastRateLimit,
+				consecutiveFailures,
+				accountRetrySleep,
+				loopSleep,
+				nextRetry.Format(time.RFC3339),
+			)
+			if err := st.MarkRateLimited(ctx, item.Username, eventAt, nextRetry, "rate_limit"); err != nil {
 				return err
 			}
 			requestsSinceLastRateLimit = 0
-			if err := sleepWithContext(ctx, cfg.RateLimitSleep); err != nil {
+			if err := sleepWithContext(ctx, loopSleep); err != nil {
 				return err
 			}
 			continue
 		}
 
 		if resp.Data == nil {
-			nextRetry := time.Now().Add(cfg.RateLimitSleep)
-			logger.Printf("empty data username=%s depth=%d err=%s", item.Username, item.DiscoveryDepth, resp.Err)
+			errKind := strings.TrimSpace(resp.Err)
+			if strings.EqualFold(errKind, "not_found") {
+				logger.Printf("skip not_found username=%s depth=%d", item.Username, item.DiscoveryDepth)
+				if err := st.MarkTerminalSkip(ctx, item.Username, "not_found", "empty data err=not_found", time.Now()); err != nil {
+					return err
+				}
+				consecutiveFailures = 0
+				continue
+			}
+
+			consecutiveFailures++
+			retrySleep := nextFailureSleep(cfg.RateLimitSleep, cfg.FailureBackoffMultiplier, consecutiveFailures)
+			nextRetry := time.Now().Add(retrySleep)
+			logger.Printf(
+				"empty data username=%s depth=%d err=%s consecutive_failures=%d retry_sleep=%s next_retry_at=%s",
+				item.Username,
+				item.DiscoveryDepth,
+				resp.Err,
+				consecutiveFailures,
+				retrySleep,
+				nextRetry.Format(time.RFC3339),
+			)
 			if err := st.MarkFailed(ctx, item.Username, time.Now(), nextRetry, fmt.Sprintf("empty data err=%s", resp.Err)); err != nil {
+				return err
+			}
+			if err := sleepWithContext(ctx, retrySleep); err != nil {
 				return err
 			}
 			continue
@@ -139,21 +249,68 @@ func Run(ctx context.Context, cfg Config) error {
 		if err := st.SaveFetchedAccount(ctx, item.Username, item.DiscoveryDepth, resp.Data, now); err != nil {
 			return err
 		}
-		if err := st.SaveFollowers(ctx, item.Username, item.DiscoveryDepth, resp.Data.FollowersByBucket(), now); err != nil {
-			return err
+		rank := 0
+		if resp.Data.Feature.Rank.KOLRank != nil {
+			rank = *resp.Data.Feature.Rank.KOLRank
+		}
+		shouldExpandFollowers := rank == 0 || cfg.ExpandRankLimit <= 0 || rank <= cfg.ExpandRankLimit
+		followersSaved := 0
+		if shouldExpandFollowers {
+			followersByBucket := resp.Data.FollowersByBucket()
+			followersSaved = countFollowers(followersByBucket)
+			if err := st.SaveFollowers(ctx, item.Username, item.DiscoveryDepth, followersByBucket, now); err != nil {
+				return err
+			}
 		}
 		if err := st.MarkFetchedSuccess(ctx, item.Username, now); err != nil {
 			return err
 		}
+		consecutiveFailures = 0
+		successCount++
+		successCount1++
+		var start time.Time
+		var end time.Duration
+		if successCount1 == 1 && successCount1 < cfg.SuccessCountEvery {
+			start = time.Now()
+		}
+		if successCount1 == cfg.SuccessCountEvery {
+			end = time.Since(start)
+			if err := sleepWithContext(ctx, cfg.SuccessCooldownAllSleep-end); err != nil {
+				return err
+			}
+		}
+
 		logger.Printf(
-			"fetch success username=%s depth=%d rank=%v followers(global=%d cn=%d top100=%d)",
+			"fetch success username=%s depth=%d rank=%d followers_saved=%d followers(global=%d cn=%d top100=%d)",
 			item.Username,
 			item.DiscoveryDepth,
-			resp.Data.Feature.Rank.KOLRank,
+			rank,
+			followersSaved,
 			resp.Data.Feature.KOLFollowers.GlobalKOLFollowersCount,
 			resp.Data.Feature.KOLFollowers.CNKOLFollowersCount,
 			resp.Data.Feature.KOLFollowers.TopKOLFollowersCount,
 		)
+		if !shouldExpandFollowers {
+			logger.Printf(
+				"skip follower expansion username=%s depth=%d rank=%d expand_rank_limit=%d",
+				item.Username,
+				item.DiscoveryDepth,
+				rank,
+				cfg.ExpandRankLimit,
+			)
+		}
+
+		if cfg.SuccessCooldownEvery > 0 && cfg.SuccessCooldownSleep > 0 && successCount%cfg.SuccessCooldownEvery == 0 {
+			logger.Printf(
+				"sleeping after success streak success_count=%d every=%d duration=%s",
+				successCount,
+				cfg.SuccessCooldownEvery,
+				cfg.SuccessCooldownSleep,
+			)
+			if err := sleepWithContext(ctx, cfg.SuccessCooldownSleep); err != nil {
+				return err
+			}
+		}
 	}
 }
 
@@ -289,4 +446,83 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func countFollowers(buckets map[string][]model.Follower) int {
+	total := 0
+	for _, followers := range buckets {
+		total += len(followers)
+	}
+	return total
+}
+
+func nextFailureSleep(base time.Duration, multiplier float64, consecutiveFailures int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	if multiplier <= 1 || consecutiveFailures <= 1 {
+		return base
+	}
+
+	wait := float64(base)
+	maxDuration := float64(time.Duration(math.MaxInt64))
+	for i := 1; i < consecutiveFailures; i++ {
+		wait *= multiplier
+		if wait >= maxDuration {
+			return time.Duration(math.MaxInt64)
+		}
+	}
+
+	return time.Duration(wait)
+}
+
+func shouldTriggerWiFiRecovery(cfg Config, consecutiveFailures int) bool {
+	if cfg.WiFiRecoverAfterFailures <= 0 {
+		return false
+	}
+	if consecutiveFailures < cfg.WiFiRecoverAfterFailures {
+		return false
+	}
+	return strings.TrimSpace(cfg.WiFiRecoverMode) != ""
+}
+
+func tryWiFiRecovery(logger *log.Logger, cfg Config, consecutiveFailures int) bool {
+	wifiCfg := wifi.Config{
+		Service:      cfg.WiFiRecoverService,
+		Mode:         cfg.WiFiRecoverMode,
+		Device:       cfg.WiFiRecoverDevice,
+		SSID:         cfg.WiFiRecoverSSID,
+		Password:     cfg.WiFiRecoverPassword,
+		FromSSID:     cfg.WiFiRecoverFromSSID,
+		FromPassword: cfg.WiFiRecoverFromPassword,
+		ToSSID:       cfg.WiFiRecoverToSSID,
+		ToPassword:   cfg.WiFiRecoverToPassword,
+		Wait:         cfg.WiFiRecoverWait,
+	}
+
+	steps, err := wifi.BuildSteps(wifiCfg)
+	if err != nil {
+		logger.Printf("wifi recovery config invalid consecutive_failures=%d err=%v", consecutiveFailures, err)
+		return false
+	}
+
+	logger.Printf(
+		"wifi recovery triggered consecutive_failures=%d mode=%s device=%s wait=%s steps=%d",
+		consecutiveFailures,
+		wifiCfg.Mode,
+		wifiCfg.Device,
+		wifiCfg.Wait,
+		len(steps),
+	)
+	for idx, step := range steps {
+		logger.Printf("wifi recovery step %d/%d %s", idx+1, len(steps), strings.Join(step, " "))
+	}
+
+	if err := wifi.Run(wifiCfg, os.Stdout, os.Stderr); err != nil {
+		logger.Printf("wifi recovery failed consecutive_failures=%d err=%v", consecutiveFailures, err)
+		return false
+	}
+
+	logger.Printf("wifi recovery completed consecutive_failures=%d", consecutiveFailures)
+	return true
 }

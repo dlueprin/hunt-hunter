@@ -75,7 +75,11 @@ SELECT username, discovery_depth
 FROM crawl_seen
 WHERE is_fetched = 0
   AND discovery_depth < ?
-  AND (next_retry_at = 0 OR next_retry_at <= ?)
+  AND (
+    fetch_status = 'rate_limited'
+    OR next_retry_at = 0
+    OR next_retry_at <= ?
+  )
 ORDER BY discovery_depth ASC, last_enqueued_at ASC, username ASC
 LIMIT 1
 `, maxDepth, now.Unix())
@@ -88,6 +92,48 @@ LIMIT 1
 		return nil, err
 	}
 	return &item, nil
+}
+
+func (s *Store) RequeueSuccessfulAccountsForReplay(ctx context.Context, depths []int, limit int, now time.Time) (int64, error) {
+	depths = normalizeDepths(depths)
+	if len(depths) == 0 {
+		return 0, nil
+	}
+
+	args := make([]any, 0, len(depths)+2)
+	args = append(args, now.Unix())
+	placeholders := make([]string, 0, len(depths))
+	for _, depth := range depths {
+		placeholders = append(placeholders, "?")
+		args = append(args, depth)
+	}
+
+	query := fmt.Sprintf(`
+UPDATE crawl_seen
+SET is_fetched = 0,
+    fetch_status = 'pending',
+    next_retry_at = 0,
+    last_error = '',
+    last_enqueued_at = ?
+WHERE is_fetched = 1
+  AND fetch_status = 'success'
+  AND discovery_depth IN (%s)
+ORDER BY discovery_depth ASC, last_success_at ASC, username ASC
+`, strings.Join(placeholders, ","))
+	if limit > 0 {
+		query += "LIMIT ?"
+		args = append(args, limit)
+	}
+
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
 }
 
 func (s *Store) MarkAttempt(ctx context.Context, username string, now time.Time) error {
@@ -134,6 +180,19 @@ SET fetch_status = 'failed',
     last_error = ?
 WHERE username = ?
 `, nextRetry.Unix(), lastError, username)
+	return err
+}
+
+func (s *Store) MarkTerminalSkip(ctx context.Context, username, status, lastError string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE crawl_seen
+SET is_fetched = 1,
+    fetch_status = ?,
+    last_success_at = ?,
+    next_retry_at = 0,
+    last_error = ?
+WHERE username = ?
+`, status, now.Unix(), lastError, username)
 	return err
 }
 
@@ -200,30 +259,228 @@ ON DUPLICATE KEY UPDATE
 }
 
 func (s *Store) SaveFollowers(ctx context.Context, sourceUsername string, sourceDepth int, buckets map[string][]model.Follower, now time.Time) error {
-	for bucket, followers := range buckets {
+	targets := collectFollowerTargets(sourceUsername, buckets)
+	if len(targets) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	newEdgeTargets, err := findNewEdgeTargets(ctx, tx, normalizeUsername(sourceUsername), targets)
+	if err != nil {
+		return err
+	}
+	if err := batchUpsertDiscoveredAccounts(ctx, tx, targets, sourceDepth+1, now); err != nil {
+		return err
+	}
+	if err := batchInsertEdges(ctx, tx, normalizeUsername(sourceUsername), targets, sourceDepth+1, now); err != nil {
+		return err
+	}
+	if err := batchIncrementDiscoveredByCount(ctx, tx, newEdgeTargets, sourceDepth+1, now); err != nil {
+		return err
+	}
+	if err := batchUpsertSeen(ctx, tx, targets, sourceDepth+1, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	tx = nil
+	return nil
+}
+
+type followerTarget struct {
+	Username    string
+	DisplayName string
+	AvatarURL   string
+	Bucket      string
+}
+
+func collectFollowerTargets(sourceUsername string, buckets map[string][]model.Follower) []followerTarget {
+	sourceUsername = normalizeUsername(sourceUsername)
+	seen := make(map[string]struct{})
+	result := make([]followerTarget, 0)
+
+	for _, bucket := range []string{"global", "cn", "top100"} {
+		followers := buckets[bucket]
 		for _, follower := range followers {
 			username := normalizeUsername(follower.Username)
-			if username == "" || username == normalizeUsername(sourceUsername) {
+			if username == "" || username == sourceUsername {
 				continue
 			}
-			if err := s.upsertDiscoveredAccount(ctx, username, follower.Name, follower.Avatar, sourceDepth+1, now); err != nil {
-				return err
+			if _, ok := seen[username]; ok {
+				continue
 			}
-			inserted, err := s.insertEdge(ctx, sourceUsername, username, bucket, sourceDepth+1, now)
-			if err != nil {
-				return err
-			}
-			if inserted {
-				if err := s.incrementDiscoveredByCount(ctx, username, sourceDepth+1, now); err != nil {
-					return err
-				}
-			}
-			if err := s.upsertSeen(ctx, username, sourceDepth+1, now); err != nil {
-				return err
-			}
+			seen[username] = struct{}{}
+			result = append(result, followerTarget{
+				Username:    username,
+				DisplayName: strings.TrimSpace(follower.Name),
+				AvatarURL:   strings.TrimSpace(follower.Avatar),
+				Bucket:      bucket,
+			})
 		}
 	}
-	return nil
+
+	return result
+}
+
+func findNewEdgeTargets(ctx context.Context, tx *sql.Tx, sourceUsername string, targets []followerTarget) (map[string]struct{}, error) {
+	args := make([]any, 0, len(targets)+1)
+	args = append(args, sourceUsername)
+	placeholders := make([]string, 0, len(targets))
+	for _, target := range targets {
+		placeholders = append(placeholders, "?")
+		args = append(args, target.Username)
+	}
+
+	query := fmt.Sprintf(`
+SELECT target_username
+FROM crawl_edges
+WHERE source_username = ?
+  AND target_username IN (%s)
+`, strings.Join(placeholders, ","))
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	existing := make(map[string]struct{}, len(targets))
+	for rows.Next() {
+		var username string
+		if err := rows.Scan(&username); err != nil {
+			return nil, err
+		}
+		existing[normalizeUsername(username)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if _, ok := existing[target.Username]; ok {
+			continue
+		}
+		result[target.Username] = struct{}{}
+	}
+	return result, nil
+}
+
+func batchUpsertDiscoveredAccounts(ctx context.Context, tx *sql.Tx, targets []followerTarget, depth int, now time.Time) error {
+	args := make([]any, 0, len(targets)*7)
+	values := make([]string, 0, len(targets))
+	for _, target := range targets {
+		values = append(values, "(?, ?, ?, ?, ?, 0, ?, ?)")
+		args = append(args,
+			target.Username,
+			target.DisplayName,
+			fmt.Sprintf("https://x.com/%s", target.Username),
+			target.AvatarURL,
+			depth,
+			now.Unix(),
+			now.Unix(),
+		)
+	}
+
+	query := fmt.Sprintf(`
+INSERT INTO kol_rankings (
+  username, display_name, profile_url, avatar_url, discovery_depth, discovered_by_count,
+  first_discovered_at, last_discovered_at
+) VALUES %s
+ON DUPLICATE KEY UPDATE
+  display_name = CASE
+    WHEN (display_name = '' OR display_name IS NULL) AND VALUES(display_name) <> '' THEN VALUES(display_name)
+    ELSE display_name
+  END,
+  profile_url = CASE
+    WHEN (profile_url = '' OR profile_url IS NULL) AND VALUES(profile_url) <> '' THEN VALUES(profile_url)
+    ELSE profile_url
+  END,
+  avatar_url = CASE
+    WHEN (avatar_url = '' OR avatar_url IS NULL) AND VALUES(avatar_url) <> '' THEN VALUES(avatar_url)
+    ELSE avatar_url
+  END,
+  discovery_depth = LEAST(discovery_depth, VALUES(discovery_depth)),
+  last_discovered_at = GREATEST(last_discovered_at, VALUES(last_discovered_at))
+`, strings.Join(values, ","))
+
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+func batchInsertEdges(ctx context.Context, tx *sql.Tx, sourceUsername string, targets []followerTarget, depth int, now time.Time) error {
+	args := make([]any, 0, len(targets)*5)
+	values := make([]string, 0, len(targets))
+	for _, target := range targets {
+		values = append(values, "(?, ?, ?, ?, ?)")
+		args = append(args, sourceUsername, target.Username, target.Bucket, depth, now.Unix())
+	}
+
+	query := fmt.Sprintf(`
+INSERT IGNORE INTO crawl_edges (
+  source_username, target_username, source_bucket, discovery_depth, discovered_at
+) VALUES %s
+`, strings.Join(values, ","))
+
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+func batchIncrementDiscoveredByCount(ctx context.Context, tx *sql.Tx, targets map[string]struct{}, depth int, now time.Time) error {
+	if len(targets) == 0 {
+		return nil
+	}
+
+	args := make([]any, 0, len(targets)+2)
+	args = append(args, depth, now.Unix())
+	placeholders := make([]string, 0, len(targets))
+	for username := range targets {
+		placeholders = append(placeholders, "?")
+		args = append(args, username)
+	}
+
+	query := fmt.Sprintf(`
+UPDATE kol_rankings
+SET discovered_by_count = discovered_by_count + 1,
+    discovery_depth = LEAST(discovery_depth, ?),
+    last_discovered_at = ?
+WHERE username IN (%s)
+`, strings.Join(placeholders, ","))
+
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+func batchUpsertSeen(ctx context.Context, tx *sql.Tx, targets []followerTarget, depth int, now time.Time) error {
+	args := make([]any, 0, len(targets)*4)
+	values := make([]string, 0, len(targets))
+	for _, target := range targets {
+		values = append(values, "(?, ?, 1, 0, 'pending', 0, 0, ?, ?)")
+		args = append(args, target.Username, depth, now.Unix(), now.Unix())
+	}
+
+	query := fmt.Sprintf(`
+INSERT INTO crawl_seen (
+  username, discovery_depth, is_enqueued, is_fetched, fetch_status,
+  attempt_count, rate_limit_count, first_enqueued_at, last_enqueued_at
+) VALUES %s
+ON DUPLICATE KEY UPDATE
+  discovery_depth = LEAST(discovery_depth, VALUES(discovery_depth)),
+  is_enqueued = 1,
+  last_enqueued_at = VALUES(last_enqueued_at)
+`, strings.Join(values, ","))
+
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
 }
 
 func (s *Store) upsertDiscoveredAccount(ctx context.Context, username, displayName, avatarURL string, depth int, now time.Time) error {
@@ -296,6 +553,26 @@ func normalizeUsername(v string) string {
 	v = strings.TrimSpace(v)
 	v = strings.TrimPrefix(v, "@")
 	return strings.ToLower(v)
+}
+
+func normalizeDepths(depths []int) []int {
+	if len(depths) == 0 {
+		return nil
+	}
+
+	seen := make(map[int]struct{}, len(depths))
+	result := make([]int, 0, len(depths))
+	for _, depth := range depths {
+		if depth < 0 {
+			continue
+		}
+		if _, ok := seen[depth]; ok {
+			continue
+		}
+		seen[depth] = struct{}{}
+		result = append(result, depth)
+	}
+	return result
 }
 
 func firstNonEmpty(values ...string) string {

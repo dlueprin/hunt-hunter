@@ -6,35 +6,26 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
-	"time"
 
 	"xhunt-hunter/internal/app"
+	"xhunt-hunter/internal/conf"
 )
 
 func main() {
-	cfg := app.Config{}
+	var configPath string
+	var migrateOnly bool
 
-	flag.StringVar(&cfg.DSN, "dsn", "", "MySQL DSN")
-	flag.StringVar(&cfg.Domain, "domain", "web3", "XHunt domain query parameter")
-	flag.StringVar(&cfg.SeedsRaw, "seeds", "", "Comma-separated seed usernames")
-	flag.IntVar(&cfg.MaxDepth, "max-depth", 2, "Max BFS depth, root seeds are depth 0")
-	flag.DurationVar(&cfg.RequestInterval, "request-interval", 15*time.Second, "Delay between successful requests")
-	flag.DurationVar(&cfg.RateLimitSleep, "rate-limit-sleep", 65*time.Second, "Sleep duration after rate limit")
-	flag.StringVar(&cfg.LogDir, "log-dir", "logs", "Directory for txt logs")
-	flag.StringVar(&cfg.ImportJSON, "import-json", "", "Comma-separated json files or directories to import into MySQL before crawling")
-	flag.BoolVar(&cfg.MigrateOnly, "migrate-only", false, "Only initialize schema and exit")
+	flag.StringVar(&configPath, "config", "config.json5", "Path to JSON5 config file")
+	flag.BoolVar(&migrateOnly, "migrate-only", false, "Only initialize schema and exit")
 	flag.Parse()
 
-	if strings.TrimSpace(cfg.DSN) == "" {
-		fmt.Fprintln(os.Stderr, "-dsn is required")
+	cfg, err := conf.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
 		os.Exit(1)
 	}
-	if cfg.MaxDepth < 1 {
-		fmt.Fprintln(os.Stderr, "-max-depth must be >= 1")
-		os.Exit(1)
-	}
+	cfg.MigrateOnly = migrateOnly
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

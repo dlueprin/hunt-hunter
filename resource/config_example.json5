@@ -1,0 +1,43 @@
+{
+  "log": {
+    "dir": "logs"
+  },
+  "mysql": {
+    "addr": "user:password@tcp(localhost:3306)/hot?parseTime=true&loc=Local&charset=utf8mb4"
+  },
+  "xhunt": {
+    "domain": "web3",
+    "seeds": "",
+    "import_json": "",
+    "max_depth": 20,
+    "expand_rank_limit": 10000
+  },
+  "service": {
+    "request_interval": "400ms",
+    "rate_limit_sleep": "3300s",
+    "failure_backoff_multiplier": 2,
+    "success_cooldown_every": 100,
+    "success_cooldown_sleep": "100ms",
+    "success_count_every": 0,
+    "success_cooldown_all_sleep": "0s"
+  },
+  "wifi_recover": {
+    "after_failures": 1,
+    "mode": "double-hop",
+    "service": "Wi-Fi",
+    "device": "en1",
+    "ssid": "",
+    "password": "",
+    "from_ssid": "YOUR_PRIMARY_WIFI",
+    "from_password": "YOUR_PRIMARY_PASSWORD",
+    "to_ssid": "YOUR_SECONDARY_WIFI",
+    "to_password": "YOUR_SECONDARY_PASSWORD",
+    "wait": "3s",
+    "post_wait": "5s"
+  },
+  "replay": {
+    "on_start": false,
+    "success_depths": [1, 2],
+    "success_limit": 0
+  }
+}
