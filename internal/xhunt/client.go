@@ -15,7 +15,7 @@ import (
 )
 
 const userInfoURL = "https://kol.xhunt.ai/api/twitter/user-info"
-const exitIPURL = "https://api.ipify.org"
+const exitIPURL = "https://api-ipv4.ip.sb/ip"
 
 type Client struct {
 	httpClient *http.Client
