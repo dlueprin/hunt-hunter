@@ -119,16 +119,27 @@ SELECT username, discovery_depth
 FROM crawl_seen
 WHERE is_fetched = 0
   AND discovery_depth < ?
-  AND (
-    fetch_status = 'rate_limited'
-    OR next_retry_at = 0
-    OR next_retry_at <= ?
-  )
+  AND fetch_status <> 'rate_limited'
+  AND (next_retry_at = 0 OR next_retry_at <= ?)
 ORDER BY discovery_depth ASC, last_enqueued_at ASC, username ASC
 LIMIT 1
 `, maxDepth, now.Unix())
 		return row.Scan(&item.Username, &item.DiscoveryDepth)
 	})
+	if err == sql.ErrNoRows {
+		err = withDBRetry(ctx, func() error {
+			row := s.db.QueryRowContext(ctx, `
+SELECT username, discovery_depth
+FROM crawl_seen
+WHERE is_fetched = 0
+  AND discovery_depth < ?
+  AND fetch_status = 'rate_limited'
+ORDER BY last_attempt_at ASC, rate_limit_count ASC, username ASC
+LIMIT 1
+`, maxDepth)
+			return row.Scan(&item.Username, &item.DiscoveryDepth)
+		})
+	}
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -312,37 +323,36 @@ func (s *Store) SaveFollowers(ctx context.Context, sourceUsername string, source
 		return nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if tx != nil {
-			_ = tx.Rollback()
+	return withDBRetry(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
 		}
-	}()
+		defer func() {
+			_ = tx.Rollback()
+		}()
 
-	newEdgeTargets, err := findNewEdgeTargets(ctx, tx, normalizeUsername(sourceUsername), targets)
-	if err != nil {
-		return err
-	}
-	if err := batchUpsertDiscoveredAccounts(ctx, tx, targets, sourceDepth+1, now); err != nil {
-		return err
-	}
-	if err := batchInsertEdges(ctx, tx, normalizeUsername(sourceUsername), targets, sourceDepth+1, now); err != nil {
-		return err
-	}
-	if err := batchIncrementDiscoveredByCount(ctx, tx, newEdgeTargets, sourceDepth+1, now); err != nil {
-		return err
-	}
-	if err := batchUpsertSeen(ctx, tx, targets, sourceDepth+1, now); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	tx = nil
-	return nil
+		newEdgeTargets, err := findNewEdgeTargets(ctx, tx, normalizeUsername(sourceUsername), targets)
+		if err != nil {
+			return err
+		}
+		if err := batchUpsertDiscoveredAccounts(ctx, tx, targets, sourceDepth+1, now); err != nil {
+			return err
+		}
+		if err := batchInsertEdges(ctx, tx, normalizeUsername(sourceUsername), targets, sourceDepth+1, now); err != nil {
+			return err
+		}
+		if err := batchIncrementDiscoveredByCount(ctx, tx, newEdgeTargets, sourceDepth+1, now); err != nil {
+			return err
+		}
+		if err := batchUpsertSeen(ctx, tx, targets, sourceDepth+1, now); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 type followerTarget struct {

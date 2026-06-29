@@ -180,7 +180,12 @@ func Run(ctx context.Context, cfg Config) error {
 			return err
 		}
 
-		logger.Printf("fetch start username=%s depth=%d request_no=%d", item.Username, item.DiscoveryDepth, requestCount)
+		exitIP, exitIPErr := client.FetchExitIP(ctx)
+		if exitIPErr != nil {
+			logger.Printf("fetch start username=%s depth=%d request_no=%d exit_ip_lookup_err=%v", item.Username, item.DiscoveryDepth, requestCount, exitIPErr)
+		} else {
+			logger.Printf("fetch start username=%s depth=%d request_no=%d exit_ip=%s", item.Username, item.DiscoveryDepth, requestCount, exitIP)
+		}
 		resp, err := client.FetchUserInfo(ctx, item.Username)
 		if err != nil {
 			consecutiveFailures++
